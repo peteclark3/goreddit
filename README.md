@@ -1,4 +1,4 @@
-# GoReddit Firehose
+# GoReddit - AI Fun with Reddit!
 
 A real-time Reddit post collector and analyzer using Go, Kafka, and PostgreSQL.
 
