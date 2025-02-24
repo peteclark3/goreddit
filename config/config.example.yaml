@@ -1,0 +1,22 @@
+reddit:
+  client_id: "your_client_id"
+  client_secret: "your_client_secret"
+  username: "your_username"
+  password: "your_password"
+
+kafka:
+  brokers: 
+    - "localhost:9092"
+  topic: "reddit-firehose"
+  group_id: "reddit-group"
+
+postgres:
+  host: "localhost"
+  port: 5432
+  user: "admin"
+  password: "your_password"
+  dbname: "postgres"
+  sslmode: "disable"
+
+api:
+  port: 8080 
