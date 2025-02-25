@@ -9,6 +9,7 @@ import (
 	"log"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/cdipaolo/sentiment"
 	kafka "github.com/segmentio/kafka-go"
@@ -37,6 +38,8 @@ func NewConsumer(cfg *config.Config, store *storage.PostgresStore) (*Consumer, e
 func (c *Consumer) Start(ctx context.Context) error {
 	defer c.reader.Close()
 
+	log.Printf("STANDALONE CONSUMER: Starting with brokers: %v, topic: %s", c.cfg.Kafka.Brokers, c.cfg.Kafka.Topic)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -44,22 +47,22 @@ func (c *Consumer) Start(ctx context.Context) error {
 		default:
 			message, err := c.reader.ReadMessage(ctx)
 			if err != nil {
-				log.Printf("Error reading message: %v", err)
+				log.Printf("STANDALONE CONSUMER: Error reading message: %v", err)
 				continue
 			}
 
 			var post reddit.Post
 			if err := json.Unmarshal(message.Value, &post); err != nil {
-				log.Printf("Error unmarshaling post: %v", err)
+				log.Printf("STANDALONE CONSUMER: Error unmarshaling post: %v", err)
 				continue
 			}
 
 			if err := c.store.SavePost(ctx, post); err != nil {
-				log.Printf("Error saving post: %v", err)
+				log.Printf("STANDALONE CONSUMER: Error saving post: %v", err)
 				continue
 			}
 
-			log.Printf("Saved post: %s from r/%s", post.Title, post.Subreddit)
+			log.Printf("STANDALONE CONSUMER: Saved post: %s from r/%s", post.Title, post.Subreddit)
 		}
 	}
 }
@@ -133,26 +136,67 @@ func (c *Consumer) analyzeSentiment(text string) float64 {
 
 func (c *Consumer) StartWithChannel(ctx context.Context, posts chan<- reddit.Post) error {
 	defer c.reader.Close()
-	defer close(posts)
+	defer func() {
+		log.Printf("API CONSUMER: Closing posts channel")
+		close(posts)
+	}()
 
-	log.Printf("Starting consumer with brokers: %v, topic: %s", c.cfg.Kafka.Brokers, c.cfg.Kafka.Topic)
+	log.Printf("API CONSUMER: Starting with brokers: %v, topic: %s", c.cfg.Kafka.Brokers, c.cfg.Kafka.Topic)
+	messageCount := 0
+	lastLogTime := time.Now()
+	lastWaitingLog := time.Now()
+	waitingMessageShown := false
 
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("API CONSUMER: Context cancelled, shutting down")
 			return nil
 		default:
+			// Log periodic status
+			now := time.Now()
+			if now.Sub(lastLogTime) >= time.Second*10 {
+				if messageCount == 0 {
+					log.Printf("API CONSUMER: No messages received in last 10 seconds. Still waiting...")
+				} else {
+					log.Printf("API CONSUMER: Status update - Processed %d messages in last 10 seconds", messageCount)
+				}
+				messageCount = 0
+				lastLogTime = now
+			}
+
+			// Show "waiting" message only once every 30 seconds
+			if !waitingMessageShown || now.Sub(lastWaitingLog) >= time.Second*30 {
+				log.Printf("API CONSUMER: [%v] Waiting for messages from Kafka topic '%s'...", time.Now().Format("15:04:05.000"), c.cfg.Kafka.Topic)
+				waitingMessageShown = true
+				lastWaitingLog = now
+			}
+
+			readStart := time.Now()
 			message, err := c.reader.ReadMessage(ctx)
+			readDuration := time.Since(readStart)
+
 			if err != nil {
-				log.Printf("Error reading message: %v", err)
+				if !strings.Contains(err.Error(), "context canceled") {
+					log.Printf("API CONSUMER: Error reading message: %v", err)
+				}
+				time.Sleep(time.Second) // Add small delay on errors
 				continue
 			}
 
-			log.Printf("Received message from Kafka: %s", string(message.Value))
+			// Reset waiting message flag when we get a message
+			waitingMessageShown = false
+			messageCount++
+
+			processStart := time.Now()
+			log.Printf("API CONSUMER: [%v] 📫 RECEIVED MESSAGE 📫 - Key: %s (read took %v)",
+				processStart.Format("15:04:05.000"),
+				string(message.Key),
+				readDuration)
 
 			var post reddit.Post
 			if err := json.Unmarshal(message.Value, &post); err != nil {
-				log.Printf("Error unmarshaling post: %v", err)
+				log.Printf("API CONSUMER: Error unmarshaling post: %v", err)
 				continue
 			}
 
@@ -166,16 +210,41 @@ func (c *Consumer) StartWithChannel(ctx context.Context, posts chan<- reddit.Pos
 			// Analyze sentiment
 			post.Sentiment = c.analyzeSentiment(text)
 
+			processDuration := time.Since(processStart)
+			log.Printf("API CONSUMER: [%v] Processed post in %v - ID: %s, Title: %s",
+				time.Now().Format("15:04:05.000"),
+				processDuration,
+				post.ID,
+				post.Title)
+
 			// Save to DB if store is provided
 			if c.store != nil {
+				dbStart := time.Now()
 				if err := c.store.SavePost(ctx, post); err != nil {
-					log.Printf("Error saving post: %v", err)
+					log.Printf("API CONSUMER: Error saving post: %v", err)
 					// Continue anyway to send to WebSocket
+				} else {
+					log.Printf("API CONSUMER: Saved to DB in %v", time.Since(dbStart))
 				}
 			}
 
-			// Send to WebSocket channel
-			posts <- post
+			// Send to WebSocket channel - use blocking send
+			sendStart := time.Now()
+			log.Printf("API CONSUMER: [%v] Attempting to send to API channel - ID: %s",
+				sendStart.Format("15:04:05.000"),
+				post.ID)
+
+			select {
+			case posts <- post:
+				sendDuration := time.Since(sendStart)
+				log.Printf("API CONSUMER: [%v] ✅ Sent to API channel in %v - ID: %s",
+					time.Now().Format("15:04:05.000"),
+					sendDuration,
+					post.ID)
+			case <-ctx.Done():
+				log.Printf("API CONSUMER: Context cancelled while trying to send post - ID: %s", post.ID)
+				return nil
+			}
 		}
 	}
 }

@@ -3,6 +3,7 @@ package reddit
 import (
 	"context"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/vartanbeno/go-reddit/v2/reddit"
@@ -10,10 +11,32 @@ import (
 
 type PostChannel chan Post
 
+// List of news and politics related subreddits
+var TargetSubreddits = []string{
+	"news",
+	"worldnews",
+	"politics",
+	"geopolitics",
+	"neutralnews",
+	"worldpolitics",
+	"internationalnews",
+	"moderatepolitics",
+	"politicaldiscussion",
+	"anime_titties", // Despite the name, this is actually a serious world news subreddit
+}
+
 func (c *Client) StreamPosts(ctx context.Context, posts PostChannel) {
-	log.Println("Starting to poll r/all/new (rate limited)")
+	log.Printf("Starting to poll the following subreddits: %s", strings.Join(TargetSubreddits, ", "))
 	seenPosts := make(map[string]bool)
 
+	// Create a map for O(1) lookup of valid subreddits
+	validSubreddits := make(map[string]bool)
+	for _, sub := range TargetSubreddits {
+		validSubreddits[strings.ToLower(sub)] = true
+	}
+
+	// Stream new posts
+	log.Printf("Starting to stream new posts from target subreddits...")
 	for {
 		select {
 		case <-ctx.Done():
@@ -24,7 +47,9 @@ func (c *Client) StreamPosts(ctx context.Context, posts PostChannel) {
 				Limit: 100, // Maximum allowed by Reddit API
 			}
 
-			submissions, _, err := c.client.Subreddit.NewPosts(ctx, "all", &opts)
+			// Join subreddits with + for multi-subreddit query
+			subredditQuery := strings.Join(TargetSubreddits, "+")
+			submissions, _, err := c.client.Subreddit.NewPosts(ctx, subredditQuery, &opts)
 			if err != nil {
 				log.Printf("Error fetching posts: %v", err)
 				time.Sleep(5 * time.Second)
@@ -32,7 +57,11 @@ func (c *Client) StreamPosts(ctx context.Context, posts PostChannel) {
 			}
 
 			for _, submission := range submissions {
-				if seenPosts[submission.ID] {
+				// Skip if we've seen this post or if it's not from our target subreddits
+				if seenPosts[submission.ID] || !validSubreddits[strings.ToLower(submission.SubredditName)] {
+					if !validSubreddits[strings.ToLower(submission.SubredditName)] {
+						log.Printf("Skipping post from non-target subreddit: r/%s", submission.SubredditName)
+					}
 					continue
 				}
 
@@ -49,6 +78,7 @@ func (c *Client) StreamPosts(ctx context.Context, posts PostChannel) {
 				select {
 				case posts <- post:
 					seenPosts[submission.ID] = true
+					log.Printf("Sent new post from r/%s: %s", post.Subreddit, post.Title)
 				case <-ctx.Done():
 					close(posts)
 					return

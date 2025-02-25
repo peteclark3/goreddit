@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -20,6 +21,8 @@ type Server struct {
 	upgrader websocket.Upgrader
 	clients  map[*websocket.Conn]bool
 	mutex    sync.Mutex
+	// Add a buffer of recent posts
+	recentPosts []reddit.Post
 }
 
 func NewServer(cfg *config.Config) *Server {
@@ -30,11 +33,15 @@ func NewServer(cfg *config.Config) *Server {
 				return true // Allow all origins in development
 			},
 		},
-		clients: make(map[*websocket.Conn]bool),
+		clients:     make(map[*websocket.Conn]bool),
+		recentPosts: make([]reddit.Post, 0, 100), // Keep last 100 posts
 	}
 }
 
 func (s *Server) Start() error {
+	log.Printf("Starting API server, clearing recent posts buffer...")
+	s.recentPosts = make([]reddit.Post, 0, 100) // Reset recent posts buffer
+
 	// Create store for persistence
 	store, err := storage.NewPostgresStore(s.cfg)
 	if err != nil {
@@ -42,8 +49,11 @@ func (s *Server) Start() error {
 	}
 	defer store.Close()
 
-	// Create Kafka consumer with store
-	consumer, err := kafka.NewConsumer(s.cfg, store) // Pass the store
+	// Create Kafka consumer with store and unique group ID
+	apiConfig := *s.cfg                                    // Make a copy of the config
+	apiConfig.Kafka.GroupID = s.cfg.Kafka.GroupID + "-api" // Add suffix for API consumer
+
+	consumer, err := kafka.NewConsumer(&apiConfig, store)
 	if err != nil {
 		return fmt.Errorf("failed to create consumer: %w", err)
 	}
@@ -70,13 +80,31 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("WebSocket upgrade error: %v", err)
 		return
 	}
-	defer conn.Close()
 
 	log.Printf("WebSocket client connected from %s", conn.RemoteAddr())
 
+	// Add client to the pool
 	s.mutex.Lock()
 	s.clients[conn] = true
 	clientCount := len(s.clients)
+
+	// Send recent posts to the new client
+	if len(s.recentPosts) > 0 {
+		log.Printf("Sending %d recent posts to new client", len(s.recentPosts))
+		for _, post := range s.recentPosts {
+			data, err := json.Marshal(post)
+			if err != nil {
+				log.Printf("Error marshaling post for new client: %v", err)
+				continue
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+				log.Printf("Error sending recent post to new client: %v", err)
+				break
+			}
+			// Small delay to prevent overwhelming the client
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
 	s.mutex.Unlock()
 
 	log.Printf("Total connected clients: %d", clientCount)
@@ -85,58 +113,102 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		s.mutex.Lock()
 		delete(s.clients, conn)
+		conn.Close()
 		s.mutex.Unlock()
 		log.Printf("Client disconnected, remaining clients: %d", len(s.clients))
 	}()
 
-	// Keep connection alive
+	// Keep connection alive and handle client messages
 	for {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("Error reading from client: %v", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket error: %v", err)
+			}
 			break
 		}
 	}
 }
 
 func (s *Server) consumePosts(consumer *kafka.Consumer) {
+	log.Printf("API: consumePosts function started")
+
 	ctx := context.Background()
-	posts := make(chan reddit.Post)
+	posts := make(chan reddit.Post, 100) // Buffered channel to prevent blocking
+
+	log.Printf("API: Created posts channel with buffer size 100")
+
+	messageCount := 0
+	lastLogTime := time.Now()
 
 	// Start consuming in background
 	go func() {
-		log.Printf("Starting Kafka consumer for WebSocket broadcast")
+		log.Printf("API: Starting Kafka consumer goroutine for WebSocket broadcast")
 		if err := consumer.StartWithChannel(ctx, posts); err != nil {
-			log.Printf("Consumer error: %v", err)
+			log.Printf("API: Consumer error: %v", err)
 		}
+		log.Printf("API: Consumer goroutine exited")
 	}()
+
+	log.Printf("API: Main loop starting to read from posts channel")
 
 	// Broadcast posts to all WebSocket clients
 	for post := range posts {
-		log.Printf("Broadcasting post to %d clients: %s", len(s.clients), post.Title)
-		s.broadcastPost(post)
-	}
-}
-
-func (s *Server) broadcastPost(post reddit.Post) {
-	data, err := json.Marshal(post)
-	if err != nil {
-		log.Printf("Error marshaling post: %v", err)
-		return
-	}
-
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	log.Printf("Broadcasting post to %d clients. Topics: %v", len(s.clients), post.Topics)
-
-	for client := range s.clients {
-		if err := client.WriteMessage(websocket.TextMessage, data); err != nil {
-			log.Printf("Error sending to client: %v", err)
-			client.Close()
-			delete(s.clients, client)
-			continue
+		messageCount++
+		now := time.Now()
+		if now.Sub(lastLogTime) >= time.Second*10 {
+			log.Printf("API: Status update - Received %d messages in last 10 seconds", messageCount)
+			messageCount = 0
+			lastLogTime = now
 		}
-		log.Printf("Successfully sent post to client")
+
+		log.Printf("API: ✨ NEW MESSAGE ✨ - Received post from consumer - ID: %s, Title: %s, Subreddit: %s", post.ID, post.Title, post.Subreddit)
+
+		func() {
+			s.mutex.Lock()
+			defer s.mutex.Unlock()
+
+			// Add to recent posts buffer
+			s.recentPosts = append(s.recentPosts, post)
+			if len(s.recentPosts) > 100 {
+				s.recentPosts = s.recentPosts[1:] // Remove oldest post
+			}
+			log.Printf("API: Added post to recent posts buffer (size: %d) - ID: %s", len(s.recentPosts), post.ID)
+
+			// Skip broadcast if no clients
+			if len(s.clients) == 0 {
+				log.Printf("API: No clients connected, post cached for future clients - ID: %s", post.ID)
+				return
+			}
+
+			data, err := json.Marshal(post)
+			if err != nil {
+				log.Printf("API: Error marshaling post: %v", err)
+				return
+			}
+
+			log.Printf("API: Broadcasting post to %d clients - ID: %s", len(s.clients), post.ID)
+
+			// Create a list of clients to remove
+			var clientsToRemove []*websocket.Conn
+
+			// Send to all clients
+			for client := range s.clients {
+				if err := client.WriteMessage(websocket.TextMessage, data); err != nil {
+					log.Printf("API: Error sending to client %s: %v", client.RemoteAddr(), err)
+					clientsToRemove = append(clientsToRemove, client)
+					continue
+				}
+				log.Printf("API: Successfully sent post to client %s - ID: %s", client.RemoteAddr(), post.ID)
+			}
+
+			// Remove failed clients
+			for _, client := range clientsToRemove {
+				delete(s.clients, client)
+				client.Close()
+				log.Printf("API: Removed failed client %s", client.RemoteAddr())
+			}
+		}()
 	}
+	log.Printf("API: Posts channel closed, consumer loop exiting")
 }

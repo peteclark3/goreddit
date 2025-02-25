@@ -38,7 +38,7 @@ func NewPostgresStore(cfg *config.Config) (*PostgresStore, error) {
 }
 
 func (s *PostgresStore) SavePost(ctx context.Context, post reddit.Post) error {
-	query := `
+	/*query := `
 		INSERT INTO reddit_posts (
 			id, title, body, subreddit, score, url, created_at, sentiment
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -61,7 +61,7 @@ func (s *PostgresStore) SavePost(ctx context.Context, post reddit.Post) error {
 	if err != nil {
 		return fmt.Errorf("failed to save post: %w", err)
 	}
-
+	*/
 	return nil
 }
 

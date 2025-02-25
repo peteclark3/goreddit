@@ -8,6 +8,7 @@ import (
 	"goreddit/internal/reddit"
 	"log"
 	"strings"
+	"time"
 
 	kafka "github.com/segmentio/kafka-go"
 )
@@ -26,7 +27,20 @@ func NewProducer(cfg *config.Config) (*Producer, error) {
 	}
 	defer conn.Close()
 
-	// Create topic if it doesn't exist
+	// Delete topic if it exists
+	log.Printf("Attempting to delete topic %s if it exists...", cfg.Kafka.Topic)
+	err = conn.DeleteTopics(cfg.Kafka.Topic)
+	if err != nil && !strings.Contains(err.Error(), "unknown topic") {
+		log.Printf("Warning: Failed to delete topic: %v", err)
+	} else {
+		log.Printf("Successfully deleted topic %s", cfg.Kafka.Topic)
+	}
+
+	// Wait a moment for deletion to complete
+	time.Sleep(2 * time.Second)
+
+	// Create topic
+	log.Printf("Creating topic %s...", cfg.Kafka.Topic)
 	topicConfigs := []kafka.TopicConfig{
 		{
 			Topic:             cfg.Kafka.Topic,
@@ -36,9 +50,10 @@ func NewProducer(cfg *config.Config) (*Producer, error) {
 	}
 
 	err = conn.CreateTopics(topicConfigs...)
-	if err != nil && !strings.Contains(err.Error(), "already exists") {
+	if err != nil {
 		return nil, fmt.Errorf("failed to create topic: %w", err)
 	}
+	log.Printf("Successfully created topic %s", cfg.Kafka.Topic)
 
 	// Create the writer
 	writer := &kafka.Writer{
@@ -55,11 +70,25 @@ func NewProducer(cfg *config.Config) (*Producer, error) {
 
 // Start begins consuming from the Reddit client and producing to Kafka
 func (p *Producer) Start(ctx context.Context, posts reddit.PostChannel) error {
+	// Create a map for O(1) lookup of valid subreddits
+	validSubreddits := make(map[string]bool)
+	for _, sub := range reddit.TargetSubreddits {
+		validSubreddits[strings.ToLower(sub)] = true
+	}
+
+	log.Printf("Producer: Starting with target subreddits: %s", strings.Join(reddit.TargetSubreddits, ", "))
+
 	for {
 		select {
 		case <-ctx.Done():
 			return p.writer.Close()
 		case post := <-posts:
+			// Skip posts from non-target subreddits
+			if !validSubreddits[strings.ToLower(post.Subreddit)] {
+				log.Printf("Producer: Skipping post from non-target subreddit: r/%s", post.Subreddit)
+				continue
+			}
+
 			if err := p.sendPost(ctx, post); err != nil {
 				log.Printf("Error sending post to Kafka: %v", err)
 				continue
@@ -70,6 +99,8 @@ func (p *Producer) Start(ctx context.Context, posts reddit.PostChannel) error {
 
 // sendPost serializes and sends a single post to Kafka
 func (p *Producer) sendPost(ctx context.Context, post reddit.Post) error {
+	log.Printf("Producer: Sending post to Kafka - ID: %s, Title: %s, Subreddit: %s", post.ID, post.Title, post.Subreddit)
+
 	value, err := json.Marshal(post)
 	if err != nil {
 		return fmt.Errorf("failed to marshal post: %w", err)
@@ -80,7 +111,12 @@ func (p *Producer) sendPost(ctx context.Context, post reddit.Post) error {
 		Value: value,
 	}
 
-	return p.writer.WriteMessages(ctx, msg)
+	if err := p.writer.WriteMessages(ctx, msg); err != nil {
+		return fmt.Errorf("failed to write message: %w", err)
+	}
+
+	log.Printf("Producer: Successfully sent post to Kafka - ID: %s", post.ID)
+	return nil
 }
 
 // Close closes the Kafka writer

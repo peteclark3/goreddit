@@ -18,6 +18,9 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	// Use a unique group ID for standalone consumer
+	cfg.Kafka.GroupID = cfg.Kafka.GroupID + "-standalone"
+
 	// Create PostgreSQL store
 	store, err := storage.NewPostgresStore(cfg)
 	if err != nil {
@@ -60,4 +63,4 @@ func main() {
 	if err := <-errCh; err != nil {
 		log.Printf("Error during shutdown: %v", err)
 	}
-} 
+}

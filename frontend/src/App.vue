@@ -18,7 +18,7 @@
           </div>
           <div class="text-gray-700" v-if="post.Body">{{ post.Body }}</div>
           <div class="text-xs text-gray-500 mt-2">
-            Topics: {{ post.Topics?.join(', ') }}
+            Topics: {{ formatTopics(post.Topics) }}
           </div>
         </div>
       </div>
@@ -35,6 +35,16 @@
           />
           <div v-else class="text-gray-500 text-center py-8">
             Waiting for topics...
+          </div>
+        </div>
+        <!-- Add frequency list -->
+        <div class="mt-4 text-sm text-gray-600">
+          <h3 class="font-semibold mb-2">Top Topics:</h3>
+          <div class="grid grid-cols-2 gap-2">
+            <div v-for="[topic, count] in cloudWords.slice(0, 20)" :key="topic" class="flex justify-between">
+              <span>{{ topic }}:</span>
+              <span class="font-mono">{{ count }}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -67,6 +77,13 @@ export default {
     }
   },
   methods: {
+    formatTopics(topics) {
+      if (!topics || !Array.isArray(topics)) return '';
+      return topics.map(topic => {
+        const count = this.topicFrequency[topic] || 0;
+        return `${topic}:${count}`;
+      }).join(', ');
+    },
     getSentimentEmoji(sentiment) {
       if (sentiment === 1.0) return '😊'
       if (sentiment === -1.0) return '😔'
